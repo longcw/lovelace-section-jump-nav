@@ -8,30 +8,74 @@
  * find a section header by its exact text, resolves its panel (the ha-card that
  * owns the header), and scrollIntoView()s / observes it.
  *
- * Scrollspy: an IntersectionObserver watches each panel against a thin band
- * near the top of the viewport. The topmost panel intersecting that band is the
- * "active" section. IO is used (not scroll events) because scroll events are
- * not `composed` and don't cross shadow boundaries — but IO observes elements
- * anywhere in the tree and fires precisely at the switch points.
+ * Auto-hide: the bar fades fully away (nothing left on screen) after a few
+ * seconds of no scrolling, and fades back in the moment you scroll again — so
+ * it never covers content while you're reading. Tapping a section keeps it
+ * visible (timer resets) so you can jump again. Swipe right anywhere on screen
+ * to dismiss it before the timeout.
+ *
+ * Detecting "user is scrolling": HA scrolls inside a shadow root and `scroll`
+ * events are not `composed`, so a window scroll listener won't fire. But
+ * `wheel` and `touchmove` ARE composed and bubble to window — a wheel, a
+ * vertical touch-drag (scroll), or a scroll key reveals the bar. Same reason
+ * scrollspy uses an IntersectionObserver instead of scroll events.
  *
  * The bar is appended to <body> on connect / removed on disconnect (so it only
- * shows on its host page). iOS gotcha: no transform / %-top on the fixed element
- * (WebKit then anchors it to the document and it drifts on scroll) — center via
- * a top:0;bottom:0 full-height flex wrapper instead.
+ * shows on its host page). iOS gotcha: no transform / %-top on the FIXED element
+ * (WebKit then anchors it to the document and it drifts on scroll) — so the
+ * fixed `.sjn-wrap` stays transform-free; hide/show animates the inner
+ * `.sjn-bar` (opacity + a tiny ≤8px slide that never crosses the viewport edge).
  *
  * Lovelace config:
  *   type: custom:section-jump-nav
+ *   timeout: 2.5          # seconds before it auto-hides (default 2.5)
+ *   swipe_out: true       # swipe right anywhere to dismiss early (default true)
+ *   swipe_in: true        # left edge-swipe also reveals it (default true;
+ *                         #   scrolling reveals it regardless)
  *   sections:
  *     - { target: "主卧", icon: "mdi:bed-king" }
  */
+const SJN_DEFAULT_TIMEOUT_S = 2.5; // fade out after this long with no scroll/interaction
+const SJN_SWIPE_PX = 40;           // horizontal travel that counts as a swipe
+const SJN_EDGE_PX = 28;            // right-edge zone width for swipe_in reveal
+const SJN_SCROLL_KEYS = new Set([
+  "ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Spacebar",
+]);
+
 class SectionJumpNav extends HTMLElement {
   setConfig(config) {
     this._config = config || {};
+    const t = parseFloat(this._config.timeout);
+    this._idleMs = (isFinite(t) && t > 0 ? t : SJN_DEFAULT_TIMEOUT_S) * 1000;
+    this._swipeIn = this._config.swipe_in !== false;    // default true
+    this._swipeOut = this._config.swipe_out !== false;  // default true
     if (this._chips) this._buildChips();
   }
 
   connectedCallback() {
     if (this._wrap) return;
+    // composed events (wheel/touchmove) bubble to window even from shadow DOM.
+    // Reveal on wheel, scroll keys, or a *vertical* touch-drag (= scrolling);
+    // a horizontal drag from the right edge reveals only when swipe_in is on.
+    this._onWheel = () => this._show();
+    this._onKey = (e) => { if (SJN_SCROLL_KEYS.has(e.key)) this._show(); };
+    this._onTouchStart = (e) => {
+      const t0 = e.touches && e.touches[0];
+      if (t0) { this._gx = t0.clientX; this._gy = t0.clientY; }
+    };
+    this._onTouchMove = (e) => {
+      const t0 = e.touches && e.touches[0];
+      if (!t0) return;
+      const dx = t0.clientX - this._gx;
+      const dy = t0.clientY - this._gy;
+      if (Math.abs(dy) >= Math.abs(dx)) { this._show(); return; } // vertical = scroll → reveal
+      // horizontal gesture:
+      if (this._swipeOut && dx > SJN_SWIPE_PX) { this._hide(); return; } // swipe right → dismiss
+      if (this._swipeIn && this._gx > window.innerWidth - SJN_EDGE_PX && dx < -SJN_SWIPE_PX) {
+        this._show(); // left edge-swipe → reveal
+      }
+    };
+
     const wrap = document.createElement("div");
     wrap.className = "sjn-wrap";
     const style = document.createElement("style");
@@ -42,12 +86,16 @@ class SectionJumpNav extends HTMLElement {
         display: flex; flex-direction: column; justify-content: center;
       }
       .sjn-bar {
-        pointer-events: auto;
+        pointer-events: none;
         display: flex; flex-direction: column; gap: 4px;
         padding: 6px 5px; border-radius: 22px;
         background: var(--card-background-color, #fff);
         box-shadow: 0 2px 12px rgba(0, 0, 0, 0.30);
+        /* hidden: faded out and nudged 8px toward the edge (never past it) */
+        opacity: 0; transform: translateX(8px);
+        transition: opacity 0.2s ease, transform 0.25s ease;
       }
+      .sjn-bar.visible { opacity: 1; transform: translateX(0); pointer-events: auto; }
       .sjn-bar button {
         all: unset; cursor: pointer; width: 34px; height: 34px;
         display: flex; align-items: center; justify-content: center;
@@ -61,32 +109,61 @@ class SectionJumpNav extends HTMLElement {
     wrap.appendChild(style);
     const bar = document.createElement("div");
     bar.className = "sjn-bar";
+    // keep it visible while the pointer is over it / being touched
+    bar.addEventListener("mouseenter", () => this._show());
+    bar.addEventListener("touchstart", () => this._show(), { passive: true });
     this._chips = bar;
     wrap.appendChild(bar);
     document.body.appendChild(wrap);
     this._wrap = wrap;
+
+    window.addEventListener("wheel", this._onWheel, { passive: true });
+    window.addEventListener("keydown", this._onKey);
+    window.addEventListener("touchstart", this._onTouchStart, { passive: true });
+    window.addEventListener("touchmove", this._onTouchMove, { passive: true });
+
     this._buildChips();
     this._startSpy();
+    this._show(); // visible on load, then fades after the idle timeout
   }
 
   disconnectedCallback() {
     if (this._io) { this._io.disconnect(); this._io = null; }
     if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._idle) { clearTimeout(this._idle); this._idle = null; }
+    if (this._onWheel) {
+      window.removeEventListener("wheel", this._onWheel, { passive: true });
+      window.removeEventListener("keydown", this._onKey);
+      window.removeEventListener("touchstart", this._onTouchStart, { passive: true });
+      window.removeEventListener("touchmove", this._onTouchMove, { passive: true });
+    }
     if (this._wrap) { this._wrap.remove(); this._wrap = null; this._chips = null; }
     this._panels = null; this._inter = null; this._buttons = null;
+  }
+
+  // --- auto-hide --------------------------------------------------------
+  _show() {
+    if (!this._chips) return;
+    this._chips.classList.add("visible");
+    if (this._idle) clearTimeout(this._idle);
+    this._idle = setTimeout(() => this._hide(), this._idleMs || SJN_DEFAULT_TIMEOUT_S * 1000);
+  }
+
+  _hide() {
+    if (this._chips) this._chips.classList.remove("visible");
   }
 
   _buildChips() {
     if (!this._chips) return;
     this._chips.innerHTML = "";
     this._buttons = [];
-    (this._config.sections || []).forEach((s, idx) => {
+    (this._config.sections || []).forEach((s) => {
       const b = document.createElement("button");
       b.title = s.label || s.target;
       const ic = document.createElement("ha-icon");
       ic.setAttribute("icon", s.icon || "mdi:chevron-right");
       b.appendChild(ic);
-      b.addEventListener("click", () => this._jump(s.target));
+      b.addEventListener("click", () => { this._jump(s.target); this._show(); });
       this._chips.appendChild(b);
       this._buttons.push(b);
     });
@@ -192,6 +269,6 @@ if (!customElements.get("section-jump-nav")) {
   window.customCards.push({
     type: "section-jump-nav",
     name: "Section Jump Nav",
-    description: "Floating in-page section jumper with scrollspy",
+    description: "Auto-hiding in-page section jumper with scrollspy",
   });
 }
